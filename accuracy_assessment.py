@@ -81,7 +81,7 @@ def create_shifted_df(series, from_range, to_range, freq_code, agg_fun, ref_name
 islands = gpd.read_file(os.path.join(base_path, islands_gpkg))
 
 # TODO: Remove filter below to add in the north island
-islands = islands[islands.island == 'south'].copy()
+# islands = islands[islands.island == 'south'].copy()
 
 ## Datasets
 tethys1 = Tethys()
@@ -274,7 +274,7 @@ for i, s in p_stns3.iterrows():
                     else:
                         combo1 = pd.merge(test_labels_df.reset_index(), predict1.reset_index(), on='time', how='left').set_index('time')
 
-                    combo1['error'] = combo1['precipitation'] - combo1['predicted']
+                    combo1['error'] = combo1['predicted'] - combo1['precipitation']
                     combo1['AE'] = combo1['error'].abs()
                     mean_actual = combo1['precipitation'].mean()
                     mean_ae = combo1['AE'].mean()
@@ -300,8 +300,312 @@ comp2 = comp1.groupby(level=['model', 'n_years'])[['NAE', 'bias']].mean()
 comp2a = comp1.groupby(level=['model', 'n_years'])[['NAE', 'bias']].std()
 comp1.groupby(level=['model', 'n_years'])[['NAE', 'bias']].count()
 
+k
+#################################
+### Combo
+
+comp_listb = []
+for i, s in p_stns3.iterrows():
+    print(s)
+
+    poly_geo = mapping(s.geo.buffer(0.15))
+
+    p_stns1 = tethys1.get_stations(era5_dataset['dataset_id'], geometry=poly_geo)
+
+    stn_ids = [s1['station_id'] for s1 in p_stns1]
+
+    era1 = tethys1.get_bulk_results(era5_dataset['dataset_id'], stn_ids, squeeze_dims=True, cache='memory').dropna('time')
+
+    era2 = era1.drop('height').to_dataframe().reset_index().drop(['lat', 'lon'], axis=1)
+    era3 = era2.set_index(['station_id', 'time'])['precipitation'].unstack(0)
+
+    # p_data2 = p_data[p_data.station_id == s['station_id']][['time', 'precipitation']].set_index('time').rename(columns={'precipitation': s['station_id']}).copy()
+    p_data2 = p_data[p_data.station_id == s['station_id']][['time', 'precipitation']].set_index('time')['precipitation'].copy()
+
+    era4 = era3[era3.index.isin(p_data2.index)].copy()
+    p_data3 = p_data2[p_data2.index.isin(era4.index)].copy()
+
+    if not p_data3.empty:
+
+        ## Correct for data that is not hourly...
+        r1 = p_data3.rolling(5, center=True)
+
+        r2 = [pd.infer_freq(r.index) for r in r1]
+
+        r3 = pd.Series(r2, index=p_data3.index)
+        r3.loc[r3.isnull()] = 'Y'
+        r3.loc[r3.str.contains('H')] = 'H'
+        r3.loc[~(r3.str.contains('H') | r3.str.contains('Y'))] = 'D'
+        r3.loc[r3.str.contains('Y')] = np.nan
+        r3 = r3.fillna('ffill')
+        r4 = r3 == 'H'
+
+        p_data3 = p_data3[r4].copy()
+        era4 = era4[era4.index.isin(p_data3.index)].copy()
+
+        p_data4 = p_data3.resample('D').sum()
+        era5 = era4.resample('D').sum()
+
+        shift = [-1, 0, 1]
+
+        ## Shift times in era5
+        df_list = []
+        for c in era5:
+            s2 = era5[c]
+            for d in shift:
+                n1 = s2.shift(d, 'D')
+                n1.name = c + '_' + str(d)
+                df_list.append(n1)
+        era6 = pd.concat(df_list, axis=1).dropna()
+
+        p_data5 = p_data4[p_data4.index.isin(era6.index)].copy()
+
+        from_date = p_data5.index[0]
+        to_date = p_data5.index[-1]
+
+        time_range = (to_date - from_date).days
+        year_range = int(time_range/365)
+
+        ## Package up for analysis
+        if year_range >= 10:
+            decades = year_range//10
+
+            test_features_df = era6
+            test_features = np.array(test_features_df)
+
+            test_labels_df = p_data5
+            test_labels = np.array(test_labels_df)
+
+            results_list = []
+
+            for i in range(decades):
+                y = (i+1)*10
+                start_date = to_date - pd.DateOffset(years=y)
+
+                train_features_df = era6.loc[start_date:to_date]
+                train_features = np.array(train_features_df)
+                train_labels_df = p_data5.loc[start_date:to_date]
+                train_labels = np.array(train_labels_df)
+
+                # gbsq = HistGradientBoostingRegressor(loss='squared_error', max_iter=100, learning_rate=0.1)
+                # gbp = HistGradientBoostingRegressor(loss='poisson', max_iter=100, learning_rate=0.1)
+                rfr = RandomForestRegressor(n_estimators = 200, n_jobs=4)
+                rfc = RandomForestClassifier(n_estimators = 200, n_jobs=4)
+
+                # model_dict = {'gbsq': gbsq, 'gbp': gbp, 'rfr': rfr}
+                # model_dict = {'rfr': rfr, 'rfc': rfc}
+
+                train_labels_c = (train_labels > 0.5).astype(int)
+                rfc.fit(train_features, train_labels_c)
+                rfr.fit(train_features, train_labels)
+
+                ## Make the predictions and combine with the actuals
+                predictions1 = rfc.predict(test_features)
+                predictions2 = rfr.predict(test_features)
+
+                predict1 = pd.Series(predictions1, index=test_features_df.index, name='predicted')
+                predict1.loc[predict1 < 0] = 0
+                # predict1 = predict1.astype(bool)
+
+                predict2 = pd.Series(predictions2, index=test_features_df.index, name='predicted')
+                predict2.loc[predict2 < 0] = 0
+
+                predict3 = predict1 * predict2
+
+                # if name == 'gbp':
+                #     predict1.loc[predict1 == predict1.min()] = 0
+
+                combo1 = pd.merge(test_labels_df.reset_index(), predict3.reset_index(), on='time', how='left').set_index('time')
+
+                combo1['error'] = combo1['predicted'] - combo1['precipitation']
+                combo1['AE'] = combo1['error'].abs()
+                mean_actual = combo1['precipitation'].mean()
+                mean_ae = combo1['AE'].mean()
+                nae = mean_ae/mean_actual
+                mean_error = combo1['error'].mean()
+                bias = mean_error/mean_actual
+
+                out_list = [s['station_id'], 'combo', start_date, to_date, y, nae, bias]
+                out1 = pd.Series(out_list, index=['station_id', 'model', 'start', 'end', 'n_years', 'NAE', 'bias'])
+                out1.name = y
+
+                out2 = out1.to_frame().T.set_index(['station_id', 'n_years', 'model'])
+
+                results_list.append(out2)
+
+            results1 = pd.concat(results_list)
+
+        comp_listb.append(results1)
+
+comp3 = pd.concat(comp_listb)
+
+comp4a = comp3.groupby(level=['model', 'n_years'])[['NAE', 'bias']].mean()
+comp4b = comp3.groupby(level=['model', 'n_years'])[['NAE', 'bias']].std()
+comp3.groupby(level=['model', 'n_years'])[['NAE', 'bias']].count()
 
 
+
+### GB
+
+comp_listc = []
+for i, s in p_stns3.iterrows():
+    print(s)
+
+    poly_geo = mapping(s.geo.buffer(0.15))
+
+    p_stns1 = tethys1.get_stations(era5_dataset['dataset_id'], geometry=poly_geo)
+
+    stn_ids = [s1['station_id'] for s1 in p_stns1]
+
+    era1 = tethys1.get_bulk_results(era5_dataset['dataset_id'], stn_ids, squeeze_dims=True, cache='memory').dropna('time')
+
+    era2 = era1.drop('height').to_dataframe().reset_index().drop(['lat', 'lon'], axis=1)
+    era3 = era2.set_index(['station_id', 'time'])['precipitation'].unstack(0)
+
+    # p_data2 = p_data[p_data.station_id == s['station_id']][['time', 'precipitation']].set_index('time').rename(columns={'precipitation': s['station_id']}).copy()
+    p_data2 = p_data[p_data.station_id == s['station_id']][['time', 'precipitation']].set_index('time')['precipitation'].copy()
+
+    era4 = era3[era3.index.isin(p_data2.index)].copy()
+    p_data3 = p_data2[p_data2.index.isin(era4.index)].copy()
+
+    if not p_data3.empty:
+
+        ## Correct for data that is not hourly...
+        r1 = p_data3.rolling(5, center=True)
+
+        r2 = [pd.infer_freq(r.index) for r in r1]
+
+        r3 = pd.Series(r2, index=p_data3.index)
+        r3.loc[r3.isnull()] = 'Y'
+        r3.loc[r3.str.contains('H')] = 'H'
+        r3.loc[~(r3.str.contains('H') | r3.str.contains('Y'))] = 'D'
+        r3.loc[r3.str.contains('Y')] = np.nan
+        r3 = r3.fillna('ffill')
+        r4 = r3 == 'H'
+
+        p_data3 = p_data3[r4].copy()
+        era4 = era4[era4.index.isin(p_data3.index)].copy()
+
+        p_data4 = p_data3.resample('D').sum()
+        era5 = era4.resample('D').sum()
+
+        shift = [-1, 0, 1]
+
+        ## Shift times in era5
+        df_list = []
+        for c in era5:
+            s2 = era5[c]
+            for d in shift:
+                n1 = s2.shift(d, 'D')
+                n1.name = c + '_' + str(d)
+                df_list.append(n1)
+        era6 = pd.concat(df_list, axis=1).dropna()
+
+        p_data5 = p_data4[p_data4.index.isin(era6.index)].copy()
+
+        from_date = p_data5.index[0]
+        to_date = p_data5.index[-1]
+
+        time_range = (to_date - from_date).days
+        year_range = int(time_range/365)
+
+        ## Package up for analysis
+        if year_range >= 10:
+            decades = year_range//10
+
+            test_features_df = era6
+            test_features = np.array(test_features_df)
+
+            test_labels_df = p_data5
+            test_labels = np.array(test_labels_df)
+
+            results_list = []
+
+            for i in range(decades):
+                y = (i+1)*10
+                start_date = to_date - pd.DateOffset(years=y)
+
+                train_features_df = era6.loc[start_date:to_date]
+                train_features = np.array(train_features_df)
+                train_labels_df = p_data5.loc[start_date:to_date]
+                train_labels = np.array(train_labels_df)
+
+                gbsq = HistGradientBoostingRegressor(loss='squared_error', max_iter=100, learning_rate=0.1)
+                # gbp = HistGradientBoostingRegressor(loss='poisson', max_iter=100, learning_rate=0.1)
+                # rfr = RandomForestRegressor(n_estimators = 200, n_jobs=4)
+                # rfc = RandomForestClassifier(n_estimators = 200, n_jobs=4)
+
+                # model_dict = {'gbsq': gbsq, 'gbp': gbp, 'rfr': rfr}
+                # model_dict = {'rfr': rfr, 'rfc': rfc}
+
+                # train_labels_c = (train_labels > 0.5).astype(int)
+                # gbsq.fit(train_features, train_labels_c)
+                gbsq.fit(train_features, train_labels)
+
+                ## Make the predictions and combine with the actuals
+                predictions1 = gbsq.predict(test_features)
+                # predictions2 = rfr.predict(test_features)
+
+                predict1 = pd.Series(predictions1, index=test_features_df.index, name='predicted')
+                predict1.loc[predict1 < 0] = 0
+                # predict1 = predict1.astype(bool)
+
+                # predict2 = pd.Series(predictions2, index=test_features_df.index, name='predicted')
+                # predict2.loc[predict2 < 0] = 0
+
+                # predict3 = predict1 * predict2
+
+                # if name == 'gbp':
+                #     predict1.loc[predict1 == predict1.min()] = 0
+
+                combo1 = pd.merge(test_labels_df.reset_index(), predict1.reset_index(), on='time', how='left').set_index('time')
+
+                combo1['error'] = combo1['predicted'] - combo1['precipitation']
+                combo1['AE'] = combo1['error'].abs()
+                mean_actual = combo1['precipitation'].mean()
+                mean_ae = combo1['AE'].mean()
+                nae = mean_ae/mean_actual
+                mean_error = combo1['error'].mean()
+                bias = mean_error/mean_actual
+
+                out_list = [s['station_id'], 'HGB', start_date, to_date, y, nae, bias]
+                out1 = pd.Series(out_list, index=['station_id', 'model', 'start', 'end', 'n_years', 'NAE', 'bias'])
+                out1.name = y
+
+                out2 = out1.to_frame().T.set_index(['station_id', 'n_years', 'model'])
+
+                results_list.append(out2)
+
+            results1 = pd.concat(results_list)
+
+        comp_listc.append(results1)
+
+comp5 = pd.concat(comp_listc)
+
+comp6a = comp5.groupby(level=['model', 'n_years'])[['NAE', 'bias']].mean()
+comp6b = comp5.groupby(level=['model', 'n_years'])[['NAE', 'bias']].std()
+comp5.groupby(level=['model', 'n_years'])[['NAE', 'bias']].count()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################
+### Other
 
 
 
